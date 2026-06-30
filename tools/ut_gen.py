@@ -25,7 +25,13 @@ from typing import List, Optional
 
 from core.llm_client import LLMClient, load_config
 from core.text_utils import extract_code_block
-from core.lang_utils import detect_language, extract_function_source
+from core.lang_utils import (
+    detect_language,
+    extract_function_source,
+    extract_include_lines,
+    extract_called_symbols,
+    find_declaring_header,
+)
 from core.ut_framework import detect_ut_framework, UTFramework
 from core import validator
 
@@ -68,12 +74,43 @@ class ToolResult:
     history: List[str] = field(default_factory=list)
 
 
+@dataclass
+class CodeFacts:
+    """从被测代码里【确定性】提取的事实，用于压制弱模型臆造。
+
+    - header_include：声明被测函数的真实头文件名（用于 #include）。
+    - source_includes：被测源文件自身的 #include 行（测试多半需要同样依赖）。
+    - collaborators：函数体内真实调用到的符号（要 mock/断言就用这些真名）。
+    """
+    header_include: str = ""
+    source_includes: List[str] = field(default_factory=list)
+    collaborators: List[str] = field(default_factory=list)
+
+
+def _collect_code_facts(
+    file_path: str, func_name: str, func_src: str, root: str, language: str
+) -> CodeFacts:
+    """仅 C/C++ 需要：把能从代码确定的事实抽出来（无网弱模型场景的关键锚点）。"""
+    facts = CodeFacts()
+    if language != "cpp":
+        return facts
+    try:
+        with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+            facts.source_includes = extract_include_lines(f.read())
+    except OSError:
+        pass
+    facts.header_include = find_declaring_header(root, func_name, file_path) or ""
+    facts.collaborators = [s for s in extract_called_symbols(func_src) if s != func_name]
+    return facts
+
+
 def _build_prompt(
     func_src: str,
     func_name: str,
     fw: UTFramework,
     fence: str,
     last_error: Optional[str],
+    facts: Optional[CodeFacts] = None,
 ) -> str:
     parts: List[str] = [
         f"请为下面这个函数编写 {fw.name} 单元测试，覆盖正常路径与边界/异常情况。",
@@ -92,6 +129,30 @@ def _build_prompt(
             fw.reference_snippet,
             "```",
         ]
+
+    # 关键：注入「确定性事实」，压制头文件名/协作者名的臆造
+    if facts is not None:
+        if facts.header_include:
+            parts += [
+                "",
+                f"【已确定的事实】被测函数声明在头文件 `{facts.header_include}`，"
+                f'测试请使用 `#include "{facts.header_include}"`，不要臆造其它头文件名。',
+            ]
+        if facts.source_includes:
+            parts += [
+                "",
+                "被测源文件本身的 #include（你的测试很可能需要相同的依赖头）：",
+                f"```{fence}",
+                "\n".join(facts.source_includes),
+                "```",
+            ]
+        if facts.collaborators:
+            parts += [
+                "",
+                "函数体内【实际调用到的符号】（若需 mock 或断言，请使用这些真实名字，"
+                "不要编造不存在的协作者）：",
+                "、".join(facts.collaborators),
+            ]
 
     parts += [
         "",
@@ -157,16 +218,22 @@ def generate_unit_test(
     meta = _FRAMEWORK_META.get(fw.name, _FRAMEWORK_META["pytest"])
     fence = meta["fence"]
 
+    facts = _collect_code_facts(file_path, func_name, func_src, root, language)
+
     result = ToolResult(ok=False)
     src_hint = fw.reference_path or "（未找到现有测试，使用默认模板）"
     result.history.append(
         f"框架={fw.name}（{'已探测' if fw.detected else '默认'}），参照: {src_hint}"
     )
+    if facts.header_include:
+        result.history.append(f"已定位被测头文件: {facts.header_include}")
+    if facts.collaborators:
+        result.history.append("协作者符号: " + "、".join(facts.collaborators))
     last_error: Optional[str] = None
 
     for i in range(1, max_iter + 1):
         result.iterations = i
-        prompt = _build_prompt(func_src, func_name, fw, fence, last_error)
+        prompt = _build_prompt(func_src, func_name, fw, fence, last_error, facts)
         try:
             raw = client.generate(prompt, system=meta["system"])
         except RuntimeError as exc:   # 模型超时/网络错：当作本轮失败，重试而非崩溃

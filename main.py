@@ -132,7 +132,21 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _force_utf8_io() -> None:
+    """让输出不会因无法编码的字符而崩溃。
+    Windows 中文环境/重定向管道默认 gbk，遇到 emoji（如 ✅）会抛
+    UnicodeEncodeError 直接崩溃。这里【保留控制台原编码】只把错误策略改成
+    'replace'：中文（gbk 可编码）照常正确显示，emoji 退化为 '?'，永不崩溃，
+    也不会像强制 UTF-8 那样在 gbk 控制台下把中文显示成乱码。"""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")  # type: ignore[attr-defined]
+        except (AttributeError, ValueError):
+            pass
+
+
 def main(argv: Optional[List[str]] = None) -> int:
+    _force_utf8_io()
     parser = build_parser()
     args = parser.parse_args(argv)
 

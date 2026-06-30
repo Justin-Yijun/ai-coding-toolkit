@@ -350,3 +350,84 @@ def extract_cuda_excerpts(source: str, markers=None) -> List[str]:
         boundary = i + 1
         i += 1
     return excerpts
+
+
+# -----------------------------------------------------------------------------
+# UT 生成辅助：把「能从代码确定的事实」抽出来喂模型，避免弱模型臆造
+#   （无网 / 小模型场景下，这些事实是生成可编译单测的关键锚点）
+# -----------------------------------------------------------------------------
+_HEADER_EXT = (".hpp", ".h", ".hh", ".hxx", ".inl")
+_IGNORE_DIRS = {".git", "__pycache__", ".venv", "venv", "node_modules", ".mypy_cache", "build"}
+_NON_CALL_KEYWORDS = {
+    "static_cast", "reinterpret_cast", "const_cast", "dynamic_cast",
+    "sizeof", "new", "delete", "alignof", "noexcept", "and", "or", "not",
+}
+
+
+def extract_include_lines(source: str) -> List[str]:
+    """按出现顺序返回源码里的 #include 行（去重、去行首空白）。"""
+    seen = set()
+    out: List[str] = []
+    for line in source.splitlines():
+        s = line.strip()
+        if re.match(r"#\s*include\b", s) and s not in seen:
+            seen.add(s)
+            out.append(s)
+    return out
+
+
+def extract_called_symbols(func_source: str, limit: int = 25) -> List[str]:
+    """从函数体里抽取「被调用的标识符」（identifier 紧跟 '('），用作 mock 提示。
+
+    先剥离注释/字符串，过滤控制关键字与类型转换关键字；按出现顺序去重，最多 limit 个。
+    目的：让模型用真实协作者名字，而不是凭空编造。
+    """
+    blanked = blank_comments_and_strings(func_source)
+    out: List[str] = []
+    seen = set()
+    for m in re.finditer(r"\b([A-Za-z_]\w*)\s*\(", blanked):
+        name = m.group(1)
+        if name in seen or name in _CTRL_KEYWORDS or name in _NON_CALL_KEYWORDS:
+            continue
+        seen.add(name)
+        out.append(name)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def find_declaring_header(project_root: str, func_name: str, source_path: str):
+    """尽力找出声明了 func_name 的头文件，返回用于 #include 的文件名（basename）。
+
+    策略：① 同目录同名兄弟头文件（foo.cpp ↔ foo.hpp）优先；
+         ② 否则全项目搜含 `func_name(` 的头文件；③ 再退化到名字相近的头。
+    找不到返回 None（让模型按参照片段自行决定，但已尽力给出确定答案）。
+    """
+    src_dir = os.path.dirname(os.path.abspath(source_path))
+    base = os.path.splitext(os.path.basename(source_path))[0]
+
+    # ① 同目录同名兄弟头文件
+    for ext in _HEADER_EXT:
+        cand = os.path.join(src_dir, base + ext)
+        if os.path.isfile(cand):
+            return os.path.basename(cand)
+
+    # ② / ③ 全项目搜索
+    decl = re.compile(r"\b" + re.escape(func_name) + r"\s*\(")
+    fallback = None
+    for cur, dirs, names in os.walk(project_root):
+        dirs[:] = [d for d in dirs if d not in _IGNORE_DIRS]
+        for name in names:
+            if os.path.splitext(name)[1].lower() not in _HEADER_EXT:
+                continue
+            path = os.path.join(cur, name)
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                    text = f.read()
+            except OSError:
+                continue
+            if decl.search(text):
+                return name
+            if fallback is None and base.lower() in name.lower():
+                fallback = name
+    return fallback
