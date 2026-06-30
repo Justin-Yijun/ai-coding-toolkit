@@ -1,0 +1,9 @@
+# ai_toolkit 运行依赖（最小化）
+# 运行期仅依赖以下两个库：
+requests>=2.31.0
+PyYAML>=6.0
+
+# 校验期工具（type/ut 任务需要；缺失时脚本会给出安装提示）：
+#   pip install pytest mypy
+pytest>=7.0.0
+mypy>=1.0.0

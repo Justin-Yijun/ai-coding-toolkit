@@ -1,0 +1,23 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.mypy_cache/
+.pytest_cache/
+
+# --- 虚拟环境 ---
+.venv/
+venv/
+env/
+
+# --- 运行产物（生成物，不入库）---
+.summaries/
+checkpoint.json
+report.md
+*.log
+
+# --- OS / 编辑器 ---
+.DS_Store
+Thumbs.db
+.idea/

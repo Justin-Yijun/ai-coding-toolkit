@@ -1,0 +1,100 @@
+# =============================================================================
+# config.yaml —— ai_toolkit 全局配置
+# 用途：集中管理 Ollama 连接、生成参数、调度器与校验器参数。
+#       所有脚本均从此文件读取配置，做到「改配置不改代码」。
+# =============================================================================
+
+ollama:
+  # 本地 Ollama 服务地址（内网无外网，固定 localhost）
+  base_url: "http://localhost:11434"
+  # 当前部署的 7B 量化模型；升级模型时只改这一行即可。
+  # 必须与 `ollama list` 里 NAME 列完全一致（含 :tag），否则会 404。
+  model: "local-qwen-7B:latest"
+  # 所有 HTTP 请求统一超时（秒）。CPU 推理慢、首次调用还要冷启动加载模型，
+  # 给足时间；深度模式喂的代码多、输出长，纯 CPU 跦 7B 建议 600s 起步。
+  timeout: 600
+  # -------------------------------------------------------------------------
+  # 【模型存放路径】本机模型目录：
+  #   C:\N-5CG4480WB2-Data\yijuzhao\Desktop\AI agent\modles
+  # Ollama 通过环境变量 OLLAMA_MODELS 定位模型，启动服务前需先设置该变量
+  # （PowerShell 示例，见 README「启动 Ollama」一节）：
+  #   $env:OLLAMA_MODELS = "C:\N-5CG4480WB2-Data\yijuzhao\Desktop\AI agent\modles"
+  #   ollama serve
+  # 注意：若 11434 端口已被占用，说明 Ollama 已在后台运行，无需再次 serve。
+  # 设置后用 `ollama list` 应能看到 local-qwen-7B:latest。
+  # -------------------------------------------------------------------------
+
+generation:
+  # -------------------------------------------------------------------------
+  # 【模型升级参数调整建议】见 core/llm_client.py 顶部注释，速查版：
+  #   - 当前 9B 弱模型：temperature=0.2（防胡说），num_predict=1024（防超时）
+  #   - 升级到 32B/70B 强模型：temperature 降到 0.05~0.1，num_predict 放开到 4096+
+  # -------------------------------------------------------------------------
+  temperature: 0.2
+  top_p: 0.9
+  # num_predict：限制单次最大输出 token，防止 CPU 长时间空转 / 上下文溢出
+  num_predict: 1024
+  # 额外停止符，留空即可
+  stop: []
+
+scheduler:
+  # 单任务最大重试次数（失败后放回队尾）
+  max_retries: 3
+  # 任务间隔延迟（秒），防止 CPU 持续高负载过热
+  delay_between_jobs: 5
+  # 断点续跑文件：记录已完成任务 ID
+  checkpoint_file: "checkpoint.json"
+  # 最终摘要报告输出路径
+  report_file: "report.md"
+
+iteration:
+  # 「生成→校验→报错塞回」黄金法则的最大迭代次数（硬约束）
+  max_iterations: 3
+
+ut:
+  # 显式指定单测框架；留空则自动从项目中探测。
+  # 可选：pytest（Python）/ googletest（C++）/ cpputest（C/C++）
+  framework: ""
+  # 从现有测试文件截取的「风格参照」注入预算（token）
+  reference_token_budget: 800
+
+validator:
+  # 确定性校验子进程超时（秒）
+  pytest_timeout: 60
+  mypy_timeout: 60
+
+summarize:
+  # 「分而治之」目录分析的参数（应对小上下文窗口）
+  # 每个文件骨架喂入模型的上限（token）
+  per_file_tokens: 600
+  # 每个文件摘要输出上限（num_predict），逐文件 MAP 阶段用
+  map_summary_tokens: 200
+  # REDUCE 归并阶段，每组拼接的 token 预算
+  reduce_group_tokens: 1500
+  # 中间结果（manifest.jsonl）与报告(summary.md)的输出目录
+  output_dir: ".summaries"
+  # -------------------------------------------------------------------------
+  # 【关注点 focus】最常用的定制方式：一句话告诉模型你关心什么，
+  #   会注入到「逐文件分析」和「归并综述」两阶段的提示词里。
+  #   留空 = 通用职责/接口总结；填写后模型只围绕该主题展开。
+  #   例：focus: "这些模块使用了哪些 CUDA 优化技巧（如共享内存、warp 级原语、
+  #              内存合并访问、流/异步、kernel 配置等），逐一指出并说明用途"
+  #   也可在命令行临时覆盖：python main.py summarize --root <dir> --focus "..."
+  #   注意：focus 改变后会用新的 manifest 缓存重新分析（旧缓存不会污染结果）。
+  focus: ""
+  # 【高级】完全自定义两阶段的 system 角色提示词；留空则用内置默认。
+  map_system: ""      # 逐文件分析的 system 提示词
+  reduce_system: ""   # 归并综述的 system 提示词
+  # -------------------------------------------------------------------------
+  # 【深度模式 deep】默认 false 只喂骨架（签名）；true 时对含 CUDA 标记的函数
+  #   抽取「完整实现体」喂模型，才能分析到 __shared__/__syncthreads/<<<>>> 等
+  #   藏在函数体里的细节。无 CUDA 标记的文件自动回退到骨架。
+  #   命令行临时开启：python main.py summarize --root <dir> --deep --focus "..."
+  deep: false
+  # 深度模式下每个文件喂入的实现体上限（token）。窗口小的模型别开太大。
+  deep_file_tokens: 1000
+  # 深度模式下每文件摘要输出上限（num_predict）。CPU 上输出越长越慢，
+  # 260 已足够列出多项技巧；要更详细可适当调大（但会明显变慢）。
+  deep_summary_tokens: 260
+  # 可选：自定义 CUDA 标记列表（留空用内置默认的一大批 __global__/atomic* 等）。
+  deep_markers: []

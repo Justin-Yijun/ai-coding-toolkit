@@ -1,0 +1,33 @@
+[
+  {
+    "id": "job-001",
+    "priority": 1,
+    "task": "ut",
+    "params": { "file": "demo.py", "func": "add" }
+  },
+  {
+    "id": "job-002",
+    "priority": 2,
+    "task": "regex",
+    "params": {
+      "desc": "匹配简单邮箱地址",
+      "pos": ["alice@example.com", "bob.k@test.org"],
+      "neg": ["not_an_email", "@nope.com", "a@@b.com"]
+    }
+  },
+  {
+    "id": "job-003",
+    "priority": 3,
+    "task": "type",
+    "params": { "file": "demo.py" }
+  },
+  {
+    "id": "job-004",
+    "priority": 5,
+    "task": "product",
+    "params": {
+      "root": ".",
+      "req": "新增一个带超时控制的简单重试装饰器，风格与现有 core 模块一致"
+    }
+  }
+]
