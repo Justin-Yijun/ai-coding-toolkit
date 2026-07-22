@@ -1,0 +1,21 @@
+[boot] system init complete, entering main loop
+[heartbeat] tick=1 status=ok
+[heartbeat] tick=2 status=ok
+[net] link up eth0
+[heartbeat] tick=3 status=ok
+[sched] task scheduler started, 8 workers
+[heartbeat] tick=4 status=ok
+[app] loading config from /etc/dma_app.conf
+[heartbeat] tick=5 status=ok
+[dma] queue depth=2 pending=0
+[heartbeat] tick=6 status=ok
+[app] user requested transfer job_id=771
+[dma] dma_start_transfer called addr=0x2000 len=8192
+[dma] reg dump: reg=0x2004 val=0x2000
+[heartbeat] tick=7 status=ok
+ERROR: DMA transfer length exceeds hardware limit, reg=0x2004 val=0x2000
+Assertion failed: len <= DMA_MAX_LEN, file drivers/dma_ctrl.c, line 12, function dma_start_transfer
+[fatal] core dumped, aborting job_id=771
+[heartbeat] tick=8 status=ok
+[heartbeat] tick=9 status=ok
+[heartbeat] tick=10 status=ok

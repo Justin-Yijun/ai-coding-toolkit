@@ -8,8 +8,11 @@
 
 1. **无状态 Skill**：每个工具只处理当前喂入的片段（单个函数 / 一段描述 / 项目骨架），
    不依赖全局变量或对话历史，天然规避上下文累积溢出。
-2. **黄金法则闭环**：`生成 → 确定性校验（AST / Pytest / Mypy）→ 报错塞回 Prompt 迭代`，
-   最大迭代 **3 次**硬编码。靠编译器/测试给客观信号，不靠模型自评。
+2. **黄金法则闭环**：`生成 → 确定性校验（AST / Pytest / Mypy / 防臆造 / grounded）
+   → 报错塞回 Prompt 迭代`，最大迭代 **3 次**硬编码。靠编译器/测试/事实核对给客观信号，
+   不靠模型自评。**没有真实构建系统时**（离线/无 toolchain），退化为确定性事实核对
+   （项目里是否真有这个头文件/模块、日志里的引用是否有据可查）—— 拦不住所有错误，
+   但能零成本拦住弱模型最常见的「编不存在的东西」这一大类幻觉。
 3. **配置驱动**：模型、温度、输出长度、超时、重试全在 `config.yaml`，
    换模型只改配置不改代码。
 
@@ -25,14 +28,19 @@ ai_toolkit/
 ├── requirements.txt
 ├── core/                # 基础设施层
 │   ├── llm_client.py    # Ollama /api/generate 封装
-│   ├── validator.py     # AST / 正则 / pytest / mypy 校验
+│   ├── validator.py     # AST / 正则 / pytest / mypy / 防臆造 / grounded 校验
+│   ├── project_facts.py # 项目级确定性事实抽取（已有头文件/模块/符号/命名风格）
+│   ├── log_facts.py     # 日志确定性事实抽取（关键行/十六进制/寄存器反查/源码定位）
+│   ├── lang_utils.py    # 多语言片段抽取（函数体/骨架/include/import）
 │   └── text_utils.py    # 代码块提取、token 估算与裁剪
-└── tools/               # 4 个无状态功能 Skill
-    ├── ut_gen.py        # 单测生成（多框架：pytest/googletest/cpputest，探测并参照现有框架）
-    ├── regex_gen.py     # 正则生成（正反例断言）
-    ├── type_annotate.py # 类型注解（ast + mypy --strict）
-    ├── product_gen.py   # 产品代码生成（项目骨架裁到 1500 tokens；Python 与 C/C++）
-    └── summarize_gen.py # 目录总结（分而治之：骨架→逐文件分析→记录拼接；支持 focus / 深度模式）
+├── tools/               # 无状态功能 Skill
+│   ├── ut_gen.py        # 单测生成（多框架：pytest/googletest/cpputest，探测并参照现有框架）
+│   ├── regex_gen.py     # 正则生成（正反例断言）
+│   ├── type_annotate.py # 类型注解（ast + mypy --strict）
+│   ├── product_gen.py   # 产品代码生成（项目骨架 + 项目事实防臆造；Python 与 C/C++）
+│   ├── log_analyze.py   # 日志问题分析（确定性抽取事实 + grounded 防幻觉校验）
+│   └── summarize_gen.py # 目录总结（分而治之：骨架→逐文件分析→记录拼接；支持 focus / 深度模式）
+└── tests/               # 确定性单测（project_facts/log_facts/validator/黄金循环防幻觉）
 ```
 
 ## 一键环境搭建
@@ -106,14 +114,52 @@ python main.py type --file demo.py
 ```
 > 产出：给 `add(a, b)` 补上 `def add(a: int, b: int) -> int` 类似注解，并过 `mypy --strict`。
 
-### 4️⃣ 产品代码生成（product）—— 参照项目风格写新代码
+### 4️⃣ 产品代码生成（product）—— 参照项目风格写新代码，防止编不存在的东西
 ```powershell
 python main.py product --root . --req "新增一个带超时控制的重试装饰器，风格与现有 core 模块一致"
 python main.py product --root ./myproject --req "新增一个 LRU 缓存类"
 ```
-> 原理：先把项目骨架裁到 1500 tokens 作上下文，生成后走 AST（Python）/ 括号配平（C/C++）校验，最多迭代 3 轮。
+> 原理：先把项目骨架裁到 1500 tokens 作上下文；同时用 `core/project_facts.py`
+> 扫描项目抽取「已有头文件/可用模块/已存在符号/命名风格」等确定性事实，注入 Prompt
+> 压制臆造，也直接喂给校验器核对。校验链：AST 语法（Python）/ 括号配平（C/C++）
+> → import/`#include` 是否真实存在（`check_python_imports_resolve` /
+> `check_cpp_includes_exist`）→ 新符号是否与项目重名（`check_no_symbol_redefinition`），
+> 任一环节失败都会把具体错误塞回 Prompt 重试，最多 3 轮。
+> 这套防臆造校验**不需要真实构建系统**（编译器/工具链缺失时也能跑），
+> 拦住的是弱模型最常见的两类错：编一个不存在的头文件/模块名、悄悄和项目里已有的定义重名。
 
-### 5️⃣ 目录总结（summarize）—— 分而治之读大项目
+### 5️⃣ 日志问题分析（log）—— 小模型也不敢瞎编日志细节
+```powershell
+# 最简单：直接分析一段日志文本
+python main.py log --file crash.log
+
+# 接上源码根目录：能把日志里的 file:line 定位到真实代码，摘取真实上下文
+python main.py log --file crash.log --src ../l1sw
+
+# 再接上 chip-manual-kit 的知识库：日志里的十六进制值能反查出真实寄存器名
+python main.py log --file crash.log --src ../l1sw --kb ../chip-manual-kit/data/knowledge.json
+
+# 追问具体问题
+python main.py log --file crash.log --question "这个故障和 DMA 有没有关系？"
+```
+> 原理（`core/log_facts.py` + `tools/log_analyze.py`）：模型**不会看到原始日志全文**，
+> 只看确定性抽取出的「事实」——围绕 `ERROR/FATAL/assert/panic` 等关键词的上下文摘录、
+> 日志里出现的十六进制 token、（可选）按地址/名字反查出手册里真实存在的寄存器、
+> （可选）解析出的 `file:line` 定位到本地源码后摘取的真实代码片段。
+> 模型只能在这些事实范围内推理，回答会用 `check_grounded_references` 校验：
+> 任何提到的十六进制值或 `文件:行号` 只要不在事实集合里，就判定为臆造并打回重试。
+> 超大日志文件（>20MB）只扫描尾部，避免爆内存；源码路径按后缀匹配本地文件，
+> 遇到多个同名文件时宁可不展开上下文，也不给错的。
+>
+> **真实数据验证过（24MB / 11.8 万行 l1sw 现场日志，事先不告知模块）**：曾经暴露过两个坑，
+> 已修好并补了回归测试——① 嵌入式/电信日志常把严重级别缩写成 `43/ERR`、`F6/ERR` 而不拼全
+> `ERROR`，朴素的整词匹配会完全漏掉真实报错；② `Error=(0 0 0 0 0 0 0 0)` 这种全零元组是
+> 健康遥测，若只按"包含 ERROR 关键词"匹配会被成千上万条这种行淹没摘录预算，反而把真正的
+> 报错挤出去。现在按"高危词优先、全零标量/元组自动排除、预算不足时保留【更靠后】的窗口"
+> 三条规则处理，修复后小模型（7B/9B）一次性正确定位到日志中段一处 SFP 激光器关闭失败
+> （`EStatus_NotPresent`）并给出合理排查建议，全程约 2 分钟、无需人工干预。
+
+### 6️⃣ 目录总结（summarize）—— 分而治之读大项目
 面对「上下文窗口小、项目很大」：每个文件先抽骨架→逐个喂模型出摘要（**边做边落盘，天然断点续跑**）→超预算就分层压缩归并。
 
 ```powershell
@@ -131,7 +177,7 @@ python main.py summarize --root ./cuda_proj --deep `
 > 中间结果落在 `manifest*.jsonl`，**中途中断重跑会自动跳过已完成的文件**。
 > `focus` / `deep` 也可写在 `config.yaml` 的 `summarize` 段里作为默认。
 
-### 6️⃣ 批处理（batch）—— 夜间无人值守
+### 7️⃣ 批处理（batch）—— 夜间无人值守
 ```powershell
 python main.py batch --jobs jobs.json
 # 等价于： python batch_scheduler.py
@@ -179,6 +225,15 @@ python main.py batch --jobs jobs.json
 - 单任务失败放回队尾，最多重试 3 次；
 - 任务间 `delay_between_jobs` 秒限速，给 CPU 降温；
 - 结束生成 `report.md`（成功/失败统计 + 失败清单）。
+
+## 跑测试
+
+`tests/` 下是纯确定性单测（不连 Ollama），覆盖事实抽取（`project_facts`/`log_facts`）、
+新增的防臆造/grounded 校验，以及用 `FakeClient` 隔离真实模型的黄金循环集成测试：
+
+```powershell
+python -m pytest tests/ -v
+```
 
 ## 模型升级
 

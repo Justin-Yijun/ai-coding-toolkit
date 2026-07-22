@@ -10,13 +10,14 @@
 from __future__ import annotations
 
 import ast
+import importlib.util
 import os
 import re
 import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List, Optional, Set, Tuple
 
 
 @dataclass
@@ -213,6 +214,159 @@ def check_cpp_test_structure(code: str, framework: str) -> CheckResult:
             ok=False,
             error=f"未发现 {framework} 断言宏（测试缺少实际断言）",
         )
+    return CheckResult(ok=True)
+
+
+# -----------------------------------------------------------------------------
+# 6) 防臆造校验：拿项目级确定性事实（core/project_facts.py）核对生成代码
+#    —— 没有真实构建系统时，这是低成本但高价值的「抓幻觉」闸门：
+#       弱模型最常见的错不是语法错，而是「编一个不存在的头文件/模块名」，
+#       或者「悄悄和项目里已有的函数/类同名」。这两类错误确定性、零漏报地可查。
+# -----------------------------------------------------------------------------
+def check_python_imports_resolve(code: str, known_modules: Optional[Set[str]] = None) -> CheckResult:
+    """校验 import 的顶层模块名是否可解析：标准库 / 已安装第三方 / 项目自身模块。
+
+    捕获弱模型编造不存在模块名（如 import numpy_utils 但项目里根本没这个模块）。
+    相对导入（from . import x）跳过，片段级无法判断项目内部相对路径是否有效。
+    """
+    try:
+        tree = ast.parse(code)
+    except SyntaxError as exc:
+        return CheckResult(ok=False, error=f"SyntaxError: {exc.msg} (line {exc.lineno})")
+
+    known = known_modules or set()
+    stdlib = getattr(sys, "stdlib_module_names", frozenset())
+    bad: List[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                top = alias.name.split(".")[0]
+                if not _py_module_resolvable(top, known, stdlib):
+                    bad.append(alias.name)
+        elif isinstance(node, ast.ImportFrom):
+            if node.level and node.level > 0:
+                continue  # 相对导入：项目内部路径，片段级无法核实
+            top = (node.module or "").split(".")[0]
+            if top and not _py_module_resolvable(top, known, stdlib):
+                bad.append(node.module or "")
+
+    if bad:
+        names = "、".join(sorted(set(bad)))
+        return CheckResult(ok=False, error=f"以下导入无法解析，疑似臆造的模块名: {names}")
+    return CheckResult(ok=True)
+
+
+def _py_module_resolvable(top: str, known: Set[str], stdlib) -> bool:
+    if not top or top in known or top in stdlib:
+        return True
+    try:
+        return importlib.util.find_spec(top) is not None
+    except (ImportError, ValueError, ModuleNotFoundError):
+        return False
+
+
+def check_cpp_includes_exist(code: str, available_headers: Optional[Set[str]] = None) -> CheckResult:
+    """校验 `#include "..."` 引用的项目内头文件是否真实存在。
+
+    只查双引号（项目内）include；`<...>` 系统/第三方头不查
+    （本机未必装有对应 SDK，误报代价远大于漏报）。
+    available_headers 为空时（如项目本身没有任何 .h/.hpp）不做强校验，直接通过。
+    """
+    if not available_headers:
+        return CheckResult(ok=True)
+    bad: List[str] = []
+    for m in re.finditer(r'#\s*include\s*"([^"]+)"', code):
+        name = os.path.basename(m.group(1))
+        if name not in available_headers:
+            bad.append(m.group(1))
+    if bad:
+        names = "、".join(sorted(set(bad)))
+        return CheckResult(ok=False, error=f'以下 #include 的头文件在项目中不存在，疑似臆造: {names}')
+    return CheckResult(ok=True)
+
+
+def check_no_symbol_redefinition(
+    code: str,
+    language: str,
+    existing_symbols: Optional[Set[str]] = None,
+) -> CheckResult:
+    """校验新代码定义的函数/类名是否与项目中已存在的符号重名。
+
+    弱模型常常不知道项目里已经有同名函数，生成的"新代码"其实是悄悄的重复定义，
+    这类错误编译器/链接器最终会报，但离线小模型场景下越早拦截越省迭代次数。
+    """
+    existing = existing_symbols or set()
+    if not existing:
+        return CheckResult(ok=True)
+    defined = _extract_defined_symbols(code, language)
+    clashes = sorted(defined & existing)
+    if clashes:
+        names = "、".join(clashes)
+        return CheckResult(ok=False, error=f"以下符号与项目中已存在的定义重名，请改名: {names}")
+    return CheckResult(ok=True)
+
+
+def _extract_defined_symbols(code: str, language: str) -> Set[str]:
+    if language == "python":
+        try:
+            tree = ast.parse(code)
+        except SyntaxError:
+            return set()
+        return {
+            n.name for n in ast.walk(tree)
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        }
+    from core.lang_utils import extract_c_skeleton
+    names: Set[str] = set()
+    try:
+        skeleton = extract_c_skeleton(code)
+    except Exception:  # noqa: BLE001 - 抽取失败不阻塞，交由其它校验兜底
+        skeleton = []
+    for line in skeleton:
+        m = re.search(r"([A-Za-z_]\w*)\s*\([^)]*\)\s*;?\s*$", line)
+        if m:
+            names.add(m.group(1))
+    return names
+
+
+# -----------------------------------------------------------------------------
+# 7) grounded 校验：模型输出中的「具体引用」是否都出自给定事实集合
+#    —— log_analyze 的核心闸门：小模型在日志分析里最容易犯的错不是语法错，
+#       是编一个事实之外的十六进制值/文件:行号，看起来煞有介事但完全不存在。
+# -----------------------------------------------------------------------------
+def check_grounded_references(
+    answer: str,
+    allowed_hex: Optional[Set[str]] = None,
+    allowed_files: Optional[Set[str]] = None,
+) -> CheckResult:
+    """校验回答里出现的十六进制值 / 文件:行号，是否都在允许集合内（大小写不敏感）。
+
+    allowed_hex/allowed_files 为 None 表示不对该类做强校验（事实源本身为空时，
+    强行要求"零引用"只会逼模型说废话，不如干脆跳过这类核对）。
+    """
+    errors: List[str] = []
+
+    if allowed_hex is not None:
+        allowed_lc = {h.lower() for h in allowed_hex}
+        bad_hex = sorted({
+            tok for tok in re.findall(r"\b0[xX][0-9a-fA-F]{2,}\b", answer)
+            if tok.lower() not in allowed_lc
+        })
+        if bad_hex:
+            errors.append("引用了事实之外的十六进制值（疑似臆造）: " + "、".join(bad_hex))
+
+    if allowed_files is not None:
+        allowed_lc = {f.lower() for f in allowed_files}
+        bad_files = sorted({
+            m.group(0)
+            for m in re.finditer(r"\b([\w.\-]+\.(?:c|cc|cpp|cxx|h|hpp|hh|hxx)):(\d+)\b", answer)
+            if m.group(1).lower() not in allowed_lc
+        })
+        if bad_files:
+            errors.append("引用了事实之外的文件:行号（疑似臆造）: " + "、".join(bad_files))
+
+    if errors:
+        return CheckResult(ok=False, error="；".join(errors))
     return CheckResult(ok=True)
 
 

@@ -1,0 +1,25 @@
+{
+  "registers": [
+    {
+      "register_name": "DMA_CTRL_LEN",
+      "module": "DMA",
+      "address": "0x2004",
+      "description": "DMA transfer length register (bytes). Must not exceed DMA_MAX_LEN.",
+      "bit_fields": []
+    },
+    {
+      "register_name": "DMA_CTRL_ADDR",
+      "module": "DMA",
+      "address": "0x2000",
+      "description": "DMA source address register.",
+      "bit_fields": []
+    }
+  ],
+  "sections": [],
+  "enums": [],
+  "formulas": [],
+  "algorithms": [],
+  "figures": [],
+  "tables": [],
+  "documents": []
+}

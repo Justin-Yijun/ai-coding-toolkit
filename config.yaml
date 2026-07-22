@@ -9,7 +9,7 @@ ollama:
   base_url: "http://localhost:11434"
   # 当前部署的 7B 量化模型；升级模型时只改这一行即可。
   # 必须与 `ollama list` 里 NAME 列完全一致（含 :tag），否则会 404。
-  model: "local-qwen-7B:latest"
+  model: "local-qwen:latest"
   # 所有 HTTP 请求统一超时（秒）。CPU 推理慢、首次调用还要冷启动加载模型，
   # 给足时间；深度模式喂的代码多、输出长，纯 CPU 跦 7B 建议 600s 起步。
   timeout: 600

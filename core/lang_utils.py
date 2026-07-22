@@ -376,6 +376,27 @@ def extract_include_lines(source: str) -> List[str]:
     return out
 
 
+def extract_python_import_lines(source: str) -> List[str]:
+    """按出现顺序返回源码里的 import/from...import 行（去重）。
+
+    与 extract_include_lines 对称，供 project_facts 统计「项目常用依赖」。
+    语法错误时静默返回空列表（调用方通常已在别处做过 ast.parse 校验）。
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+    seen = set()
+    out: List[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            seg = ast.get_source_segment(source, node)
+            if seg and seg not in seen:
+                seen.add(seg)
+                out.append(seg)
+    return out
+
+
 def extract_called_symbols(func_source: str, limit: int = 25) -> List[str]:
     """从函数体里抽取「被调用的标识符」（identifier 紧跟 '('），用作 mock 提示。
 

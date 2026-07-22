@@ -8,6 +8,7 @@
 #   python main.py regex --desc "匹配邮箱" --pos a@b.com --neg "not_email"
 #   python main.py type --file snippet.py            # 读取整文件作为函数源码
 #   python main.py product --root ./myproject --req "新增一个重试装饰器"
+#   python main.py log --file crash.log --src ./myproject --kb ../chip-manual-kit/data/knowledge.json
 #   python main.py batch --jobs jobs.json            # 夜间无人值守批处理
 #
 # 兼容需求中的 `--task` 风格：
@@ -24,6 +25,7 @@ from tools.regex_gen import generate_regex
 from tools.type_annotate import annotate_types
 from tools.product_gen import generate_product
 from tools.summarize_gen import summarize_project
+from tools.log_analyze import analyze_log
 
 
 def _print_result(title: str, result) -> int:
@@ -76,6 +78,20 @@ def _cmd_summarize(args: argparse.Namespace) -> int:
     return _print_result(f"项目总结 @ {args.root}", res)
 
 
+def _cmd_log(args: argparse.Namespace) -> int:
+    log_text = ""
+    if getattr(args, "text", None):
+        log_text = args.text
+    res = analyze_log(
+        log_text=log_text,
+        log_file=getattr(args, "file", None),
+        question=getattr(args, "question", None) or "分析这段日志，给出最可能的问题原因与排查建议。",
+        kb_path=getattr(args, "kb", None),
+        source_root=getattr(args, "src", None),
+    )
+    return _print_result("日志分析", res)
+
+
 def _cmd_batch(args: argparse.Namespace) -> int:
     # 延迟导入，避免无关命令也加载调度器
     from batch_scheduler import run_batch
@@ -88,7 +104,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="本地受限环境 AI 辅助编程工具集（Ollama + 确定性校验）",
     )
     # 兼容 `--task xxx` 写法（可选；不传则用子命令）
-    parser.add_argument("--task", choices=["ut", "regex", "type", "product", "summarize", "batch"],
+    parser.add_argument("--task", choices=["ut", "regex", "type", "product", "summarize", "log", "batch"],
                         help="任务类型（等价于子命令）")
 
     sub = parser.add_subparsers(dest="command")
@@ -124,6 +140,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_sm.add_argument("--deep", action="store_true",
                       help="深度模式：对含 CUDA 标记的函数抽完整实现体分析（看到 __shared__/<<<>>> 等细节）")
     p_sm.set_defaults(handler=_cmd_summarize)
+
+    p_lg = sub.add_parser("log", help="日志问题分析（确定性抽取事实 + grounded 防幻觉校验）")
+    p_lg.add_argument("--file", default=None, help="日志文件路径（与 --text 二选一，优先）")
+    p_lg.add_argument("--text", default=None, help="直接传入的日志文本片段")
+    p_lg.add_argument("--question", default=None, help="想问的具体问题（默认：分析原因与排查建议）")
+    p_lg.add_argument("--src", default=None, help="源码根目录（可选，用于定位到真实源码上下文）")
+    p_lg.add_argument("--kb", default=None,
+                      help="chip-manual-kit 的 knowledge.json 路径（可选，用于反查真实寄存器名）")
+    p_lg.set_defaults(handler=_cmd_log)
 
     p_ba = sub.add_parser("batch", help="从 jobs.json 批处理（夜间无人值守）")
     p_ba.add_argument("--jobs", default="jobs.json", help="任务队列文件")

@@ -21,3 +21,9 @@ report.md
 .DS_Store
 Thumbs.db
 .idea/
+
+# --- 本地专属 / 体积过大或含内部路径的现场数据（不入库）---
+# 远端构建环境导出的 compile_commands.json：含内部路径/编译参数，因项目而异
+compile_commands.json
+# 真实现场日志（几十 MB，含内部主机/进程信息），demo 用的是 demo_log.txt（合成小样本）
+demo_project/journal*.txt
