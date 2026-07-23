@@ -26,6 +26,7 @@ from tools.type_annotate import annotate_types
 from tools.product_gen import generate_product
 from tools.summarize_gen import summarize_project
 from tools.log_analyze import analyze_log
+from core import log_memory, learned_registers
 
 
 def _print_result(title: str, result) -> int:
@@ -88,8 +89,34 @@ def _cmd_log(args: argparse.Namespace) -> int:
         question=getattr(args, "question", None) or "分析这段日志，给出最可能的问题原因与排查建议。",
         kb_path=getattr(args, "kb", None),
         source_root=getattr(args, "src", None),
+        use_memory=not getattr(args, "no_memory", False),
     )
-    return _print_result("日志分析", res)
+    code = _print_result("日志分析", res)
+    if res.reused_case_id:
+        print(f"\n[记忆] 本次直接复用已确认历史案例 case_id={res.reused_case_id}（未调用模型）。")
+    elif res.case_id:
+        print(
+            f"\n[记忆] 本次结论已自动存为未确认案例 case_id={res.case_id}。"
+            f"确认结论正确后可执行：\n"
+            f"  python main.py log-confirm --src {getattr(args, 'src', None)} --case-id {res.case_id}"
+        )
+    return code
+
+
+def _cmd_log_confirm(args: argparse.Namespace) -> int:
+    ok = log_memory.confirm_case(log_memory.resolve_memory_path(args.src), args.case_id)
+    if not ok:
+        print(f"[失败] 未找到 case_id={args.case_id}（或 --src 下没有案例记忆文件）")
+        return 1
+    print(f"[成功] 案例 {args.case_id} 已标记为已确认，之后高相似度命中可直接复用。")
+    if getattr(args, "register_note", None):
+        reg_ok = learned_registers.add_register_note(args.src, args.register_note)
+        if reg_ok:
+            print(f"[成功] 架构规则记忆已更新：{args.register_note}")
+        else:
+            print(f"[失败] 架构规则注解格式应为 `0xADDR=名称 描述`，实际为：{args.register_note}")
+            return 1
+    return 0
 
 
 def _cmd_batch(args: argparse.Namespace) -> int:
@@ -104,7 +131,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="本地受限环境 AI 辅助编程工具集（Ollama + 确定性校验）",
     )
     # 兼容 `--task xxx` 写法（可选；不传则用子命令）
-    parser.add_argument("--task", choices=["ut", "regex", "type", "product", "summarize", "log", "batch"],
+    parser.add_argument("--task", choices=["ut", "regex", "type", "product", "summarize", "log", "log-confirm", "batch"],
                         help="任务类型（等价于子命令）")
 
     sub = parser.add_subparsers(dest="command")
@@ -148,7 +175,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_lg.add_argument("--src", default=None, help="源码根目录（可选，用于定位到真实源码上下文）")
     p_lg.add_argument("--kb", default=None,
                       help="chip-manual-kit 的 knowledge.json 路径（可选，用于反查真实寄存器名）")
+    p_lg.add_argument("--no-memory", action="store_true",
+                      help="禁用案例记忆（默认开启：自动存入/检索历史案例，仅当提供 --src 时生效）")
     p_lg.set_defaults(handler=_cmd_log)
+
+    p_lc = sub.add_parser("log-confirm", help="人工确认一条历史案例（升级为可直接复用的强信任案例），可选同时登记架构规则")
+    p_lc.add_argument("--src", required=True, help="源码根目录（决定案例记忆文件位置 .ai_toolkit/log_cases.jsonl）")
+    p_lc.add_argument("--case-id", required=True, help="要确认的案例 ID（analyze_log 输出里给出）")
+    p_lc.add_argument("--register-note", default=None,
+                      help="可选：同时登记一条架构规则，格式 `0xADDR=名称 描述`")
+    p_lc.set_defaults(handler=_cmd_log_confirm)
 
     p_ba = sub.add_parser("batch", help="从 jobs.json 批处理（夜间无人值守）")
     p_ba.add_argument("--jobs", default="jobs.json", help="任务队列文件")

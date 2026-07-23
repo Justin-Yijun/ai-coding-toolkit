@@ -11,11 +11,12 @@
 from __future__ import annotations
 
 import ast
+import json
 import os
 import re
 from collections import Counter
-from dataclasses import dataclass, field
-from typing import List, Set
+from dataclasses import asdict, dataclass, field
+from typing import List, Set, Tuple
 
 from core.lang_utils import (
     extract_include_lines,
@@ -31,6 +32,9 @@ _PY_EXT = {".py", ".pyi"}
 # 项目扫描规模保护：避免在超大仓库（如 l1sw 级别）上无限遍历拖垫小模型场景的响应时间
 _MAX_FILES_SCANNED = 4000
 _MAX_FILE_BYTES = 512 * 1024  # 单文件超过 512KB 跳过（生成代码/骨架用不到这么大的文件）
+
+_CACHE_DIR_NAME = ".ai_toolkit"
+_CACHE_FILE_NAME = "project_facts_cache.json"
 
 
 @dataclass
@@ -159,13 +163,117 @@ def _collect_python_facts(project_root: str, facts: ProjectFacts) -> None:
     facts.truncated = facts.files_scanned >= _MAX_FILES_SCANNED
 
 
-def collect_project_facts(project_root: str, language: str) -> ProjectFacts:
-    """主入口：扫描 project_root，按语言分派抽取确定性事实。"""
+def collect_project_facts(project_root: str, language: str, use_cache: bool = True) -> ProjectFacts:
+    """主入口：扫描 project_root，按语言分派抽取确定性事实。
+
+    use_cache=True 时，先按「文件数+最大 mtime」算一个目录指纹（只 stat 不读内容，
+    大项目上也很快）；指纹与上次缓存一致就直接复用缓存结果，跳过整个重扫描——
+    这是"时间换等效能力"的一部分：没必要每次调用都重新扫一遍没变化的项目。
+    缓存文件存放在 `<project_root>/.ai_toolkit/project_facts_cache.json`。
+    """
     facts = ProjectFacts(language=language)
     if not os.path.isdir(project_root):
         return facts
+
+    exts = _PY_EXT if language == "python" else _CPP_EXT
+    cache_path = _cache_path(project_root) if use_cache else None
+
+    if cache_path:
+        fingerprint = _dir_fingerprint(project_root, exts)
+        cached = _load_cache(cache_path, language, fingerprint)
+        if cached is not None:
+            return cached
+
     if language == "python":
         _collect_python_facts(project_root, facts)
     else:
         _collect_cpp_facts(project_root, facts)
+
+    if cache_path:
+        _save_cache(cache_path, language, _dir_fingerprint(project_root, exts), facts)
+
     return facts
+
+
+def _dir_fingerprint(project_root: str, exts: Set[str]) -> Tuple[int, float]:
+    """（文件数, 最大 mtime）指纹：只 stat 不读内容，判断项目自上次扫描后是否变化过。"""
+    count = 0
+    max_mtime = 0.0
+    for root, dirs, files in os.walk(project_root):
+        dirs[:] = [d for d in dirs if d not in _IGNORE_DIRS]
+        for fn in files:
+            if os.path.splitext(fn)[1].lower() not in exts:
+                continue
+            path = os.path.join(root, fn)
+            try:
+                mtime = os.path.getmtime(path)
+            except OSError:
+                continue
+            count += 1
+            if mtime > max_mtime:
+                max_mtime = mtime
+    return count, max_mtime
+
+
+def _cache_path(project_root: str) -> str | None:
+    mem_dir = os.path.join(project_root, _CACHE_DIR_NAME)
+    try:
+        os.makedirs(mem_dir, exist_ok=True)
+    except OSError:
+        return None
+    return os.path.join(mem_dir, _CACHE_FILE_NAME)
+
+
+def _facts_to_dict(facts: ProjectFacts) -> dict:
+    data = asdict(facts)
+    data["available_headers"] = sorted(facts.available_headers)
+    data["available_py_modules"] = sorted(facts.available_py_modules)
+    data["existing_symbols"] = sorted(facts.existing_symbols)
+    return data
+
+
+def _facts_from_dict(data: dict) -> ProjectFacts:
+    return ProjectFacts(
+        language=data.get("language", "python"),
+        available_headers=set(data.get("available_headers", [])),
+        available_py_modules=set(data.get("available_py_modules", [])),
+        existing_symbols=set(data.get("existing_symbols", [])),
+        common_includes=list(data.get("common_includes", [])),
+        naming_style=data.get("naming_style", ""),
+        files_scanned=int(data.get("files_scanned", 0)),
+        truncated=bool(data.get("truncated", False)),
+    )
+
+
+def _load_cache(cache_path: str, language: str, fingerprint: Tuple[int, float]) -> ProjectFacts | None:
+    if not cache_path or not os.path.isfile(cache_path):
+        return None
+    try:
+        with open(cache_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    entry = data.get(language)
+    if not entry:
+        return None
+    if list(entry.get("fingerprint", [])) != list(fingerprint):
+        return None  # 目录变了（文件数或最新 mtime 不一致），缓存失效
+    return _facts_from_dict(entry.get("facts", {}))
+
+
+def _save_cache(cache_path: str, language: str, fingerprint: Tuple[int, float], facts: ProjectFacts) -> None:
+    if not cache_path:
+        return
+    data = {}
+    if os.path.isfile(cache_path):
+        try:
+            with open(cache_path, "r", encoding="utf-8") as f:
+                data = json.load(f) or {}
+        except (OSError, json.JSONDecodeError):
+            data = {}
+    data[language] = {"fingerprint": list(fingerprint), "facts": _facts_to_dict(facts)}
+    try:
+        with open(cache_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+    except OSError:
+        pass

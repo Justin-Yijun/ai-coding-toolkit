@@ -32,6 +32,8 @@ import re
 from dataclasses import dataclass, field
 from typing import List, Optional
 
+from core import learned_registers
+
 # 日志文件超大时只扫描"尾部"这么多字节（most-recent-first 的调试直觉：
 # 现场捕获的日志，问题通常发生在末尾附近）。可通过参数覆盖。
 _DEFAULT_MAX_SCAN_BYTES = 20 * 1024 * 1024  # 20MB
@@ -70,8 +72,21 @@ _GLIBC_ASSERT_RE = re.compile(
     re.IGNORECASE,
 )
 
+# GDB/glibc 风格调用栈帧：#0  0xADDR in func (args) at file:line
+_GDB_FRAME_RE = re.compile(
+    r"^#(\d+)\s+(?:0x[0-9a-fA-F]+\s+in\s+)?(\S+)\s*\([^)]*\)\s*(?:at\s+([\w./\\-]+):(\d+))?"
+)
+# Python traceback 风格：File "x.py", line 42, in some_func
+_PY_TRACEBACK_RE = re.compile(r'File\s+"([^"]+)",\s*line\s+(\d+),\s*in\s+(\S+)')
+
+# 归一化模板用：把可变的数值/时间戳换成占位符，识别「同一条错误反复刷屏」
+_TS_RE = re.compile(r"\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?\b")
+_NORM_HEX_RE = re.compile(r"\b0[xX][0-9a-fA-F]+\b")
+_NORM_NUM_RE = re.compile(r"\b\d+\b")
+
 _IGNORE_DIRS = {".git", "__pycache__", ".venv", "venv", "node_modules", ".mypy_cache", "build"}
 _MAX_FILE_SEARCH = 20000  # 源码根目录下搜索文件名的规模保护
+_DEFAULT_MIN_REPEAT_TO_FOLD = 3  # 同一归一化模板的高危报错达到这个次数才折叠（config.yaml 可覆盖）
 
 
 @dataclass
@@ -96,12 +111,40 @@ class SourceLocation:
 
 
 @dataclass
+class ErrorGroup:
+    """同一归一化模板的高危报错反复刷屏时，折叠后的分组记录（短期记忆去重）。"""
+    normalized: str
+    sample_line: str
+    count: int
+    first_line: int
+    last_line: int
+
+
+@dataclass
+class StackFrame:
+    """调用栈里的单帧：index=0 是最内层/崩溃点，往后是外层调用者。"""
+    index: int
+    function: str
+    file: str = ""
+    line: int = 0
+
+
+@dataclass
+class StackTrace:
+    """一条完整的、有序的调用栈（GDB/glibc backtrace、Python traceback 或单帧 assert）。"""
+    frames: List[StackFrame] = field(default_factory=list)
+    anchor_line: int = 0  # 该栈在日志中第一行出现的真实行号（定位用）
+
+
+@dataclass
 class LogFacts:
     """日志问题分析的确定性事实集合。"""
     excerpt: str = ""
     hex_tokens: List[str] = field(default_factory=list)
     register_hits: List[RegisterHit] = field(default_factory=list)
     source_locations: List[SourceLocation] = field(default_factory=list)
+    error_groups: List[ErrorGroup] = field(default_factory=list)
+    stack_traces: List[StackTrace] = field(default_factory=list)
     total_lines_scanned: int = 0
     truncated: bool = False
     # 文件被截断（只扫描尾部）时，跳过了原文件开头这么多行；excerpt 里标注的
@@ -137,7 +180,60 @@ def _find_hit_indices(lines: List[str], regex: re.Pattern) -> List[int]:
     return [i for i, ln in enumerate(lines) if _line_has_real_signal(ln, regex)]
 
 
-def _extract_excerpt(lines: List[str], context_lines: int, token_budget: int, line_offset: int = 0) -> str:
+def _normalize_line(line: str) -> str:
+    """把行内可变的时间戳/十六进制/十进制数字换成占位符，得到用于分组去重的模板。
+
+    识别"同一条报错反复刷屏"（如循环里每次都打同一条 ERROR，只有计数器/地址不同），
+    是 README 里"全零计数器挤爆预算"那个坑的姊妹问题——这次是【非零但海量重复】的报错。
+    """
+    norm = _TS_RE.sub("<TS>", line)
+    norm = _NORM_HEX_RE.sub("<HEX>", norm)
+    norm = _NORM_NUM_RE.sub("<NUM>", norm)
+    return norm.strip()
+
+
+def _group_repeated_errors(
+    lines: List[str], hit_indices: List[int], line_offset: int, min_repeat: int
+) -> tuple[List[int], List["ErrorGroup"]]:
+    """按归一化模板对命中行分组；同一模板达到 min_repeat 次时，只保留首、末两条命中
+    参与后续摘录窗口，其余折叠为一条 ErrorGroup 记录（节省摘录预算给真正不同的信号）。
+    """
+    template_to_indices: dict[str, List[int]] = {}
+    order: List[str] = []
+    for idx in hit_indices:
+        tpl = _normalize_line(lines[idx])
+        if tpl not in template_to_indices:
+            template_to_indices[tpl] = []
+            order.append(tpl)
+        template_to_indices[tpl].append(idx)
+
+    kept_indices: List[int] = []
+    groups: List[ErrorGroup] = []
+    for tpl in order:
+        idxs = template_to_indices[tpl]
+        if len(idxs) >= min_repeat:
+            kept_indices.append(idxs[0])
+            kept_indices.append(idxs[-1])
+            groups.append(ErrorGroup(
+                normalized=tpl,
+                sample_line=lines[idxs[0]].strip(),
+                count=len(idxs),
+                first_line=line_offset + idxs[0] + 1,
+                last_line=line_offset + idxs[-1] + 1,
+            ))
+        else:
+            kept_indices.extend(idxs)
+    kept_indices = sorted(set(kept_indices))
+    return kept_indices, groups
+
+
+def _extract_excerpt(
+    lines: List[str],
+    context_lines: int,
+    token_budget: int,
+    line_offset: int = 0,
+    min_repeat_to_fold: int = _DEFAULT_MIN_REPEAT_TO_FOLD,
+) -> tuple[str, List["ErrorGroup"]]:
     # 高危词优先：ERROR/FATAL/assert/panic/.../ERR 缩写等，基本等同"确认出问题"。
     # 只有一个高危命中都没有时，才退化用中危词（FAIL/WARN 等，噪声更多）兜底。
     hit_indices = _find_hit_indices(lines, _HIGH_RE)
@@ -151,7 +247,9 @@ def _extract_excerpt(lines: List[str], context_lines: int, token_budget: int, li
         text = "\n".join(
             f"{line_offset + len(lines) - tail_n + i + 1}: {ln}" for i, ln in enumerate(chunk)
         )
-        return _truncate_excerpt(text, token_budget)
+        return _truncate_excerpt(text, token_budget), []
+
+    hit_indices, error_groups = _group_repeated_errors(lines, hit_indices, line_offset, min_repeat_to_fold)
 
     # 合并重叠/相邻窗口
     windows: List[List[int]] = []
@@ -171,7 +269,7 @@ def _extract_excerpt(lines: List[str], context_lines: int, token_budget: int, li
     max_chars = token_budget * 4
     total = sum(len(p) for p in parts) + 5 * (len(parts) - 1)
     if total <= max_chars:
-        return "\n...\n".join(parts)
+        return "\n...\n".join(parts), error_groups
 
     # 预算不够装下所有命中窗口：优先保留【更靠后】的窗口（现场问题多在末尾附近，
     # 且这正是本次真实日志踩过的坑——从头截断会把末尾真正的报错切掉）。
@@ -192,7 +290,7 @@ def _extract_excerpt(lines: List[str], context_lines: int, token_budget: int, li
         text = f"（更早的 {omitted} 处关键片段因预算限制已省略，只保留时间上更靠后的）...\n" + text
     # 安全兜底：极端情况下单个窗口本身就远超预算（如 context_lines 设得很大），
     # 用更宽松的硬上限兜底，避免真的无限增长；正常情况下不会触发二次截断。
-    return _truncate_excerpt(text, token_budget * 3)
+    return _truncate_excerpt(text, token_budget * 3), error_groups
 
 
 def _truncate_excerpt(text: str, token_budget: int) -> str:
@@ -243,11 +341,19 @@ def _load_kb_registers(kb_path: str) -> List[dict]:
 
 
 def _lookup_registers(
-    hex_tokens: List[str], raw_text: str, kb_path: Optional[str], limit: int = 30
+    hex_tokens: List[str],
+    raw_text: str,
+    kb_path: Optional[str],
+    source_root: Optional[str] = None,
+    limit: int = 30,
 ) -> List[RegisterHit]:
-    if not kb_path:
-        return []
-    registers = _load_kb_registers(kb_path)
+    """反查真实存在的寄存器：外部 chip-manual-kit 的 kb（可选）+ 本工具自己积累的
+    架构规则记忆 learned_registers.json（若 source_root 下存在），两者叠加、互不依赖。
+    """
+    registers: List[dict] = []
+    if kb_path:
+        registers.extend(_load_kb_registers(kb_path))
+    registers.extend(learned_registers.load_registers(source_root))
     if not registers:
         return []
 
@@ -313,6 +419,86 @@ def _extract_source_locations(raw_text: str, limit: int = 20) -> List[SourceLoca
             break
 
     return out[:limit]
+
+
+# -----------------------------------------------------------------------------
+# 4b) 结构化调用栈解析（短期记忆增强：给模型一条有序调用链，而不是散落的 file:line）
+# -----------------------------------------------------------------------------
+def _line_number_at(raw_text: str, pos: int, line_offset: int) -> int:
+    return line_offset + raw_text.count("\n", 0, pos) + 1
+
+
+def _extract_stack_traces(
+    lines: List[str], raw_text: str, line_offset: int = 0, limit: int = 5
+) -> List["StackTrace"]:
+    """识别常见的多帧调用栈（GDB/glibc backtrace、Python traceback），聚合成有序
+    StackTrace（frame 0 = 最内层/崩溃点）；另把单帧 glibc assert 也包成 size=1 的
+    StackTrace，方便和多帧调用栈统一展示/统一作为 grounded 校验的锚点。
+    """
+    traces: List[StackTrace] = []
+    covered_lines: set = set()
+    i = 0
+    n = len(lines)
+    while i < n and len(traces) < limit:
+        stripped = lines[i].strip()
+        m = _GDB_FRAME_RE.match(stripped)
+        if m and int(m.group(1)) == 0:
+            anchor = line_offset + i + 1
+            frames: List[StackFrame] = []
+            j = i
+            while j < n:
+                fm = _GDB_FRAME_RE.match(lines[j].strip())
+                if not fm:
+                    break
+                frames.append(StackFrame(
+                    index=int(fm.group(1)), function=fm.group(2),
+                    file=fm.group(3) or "", line=int(fm.group(4)) if fm.group(4) else 0,
+                ))
+                covered_lines.add(line_offset + j + 1)
+                j += 1
+            if frames:
+                traces.append(StackTrace(frames=frames, anchor_line=anchor))
+            i = j
+            continue
+
+        pm = _PY_TRACEBACK_RE.search(lines[i])
+        if pm:
+            anchor = line_offset + i + 1
+            frames = []
+            j = i
+            while j < n:
+                fm2 = _PY_TRACEBACK_RE.search(lines[j])
+                if not fm2:
+                    break
+                frames.append(StackFrame(
+                    index=len(frames), function=fm2.group(3), file=fm2.group(1), line=int(fm2.group(2)),
+                ))
+                covered_lines.add(line_offset + j + 1)
+                j += 1
+            if frames:
+                traces.append(StackTrace(frames=frames, anchor_line=anchor))
+            i = j
+            continue
+
+        i += 1
+
+    # 单帧 glibc assert：复用为 size=1 的 StackTrace，和多帧调用栈统一展示/统一锚定。
+    # 跳过已被 GDB/Python traceback 帧覆盖的行——_GLIBC_ASSERT_RE 的 "file X, line N"
+    # 是宽松的通用模式，会误命中 Python traceback 的 `File "x.py", line N, in f`，
+    # 靠 covered_lines 去重，避免同一行被算作两条不同的 StackTrace。
+    for m in _GLIBC_ASSERT_RE.finditer(raw_text):
+        if len(traces) >= limit:
+            break
+        anchor = _line_number_at(raw_text, m.start(), line_offset)
+        if anchor in covered_lines:
+            continue
+        file_, line_, func_ = m.group(1), int(m.group(2)), m.group(3) or ""
+        traces.append(StackTrace(
+            frames=[StackFrame(index=0, function=func_, file=file_, line=line_)],
+            anchor_line=anchor,
+        ))
+
+    return traces
 
 
 def _find_local_file(source_root: str, logged_path: str) -> tuple[Optional[str], bool]:
@@ -441,16 +627,19 @@ def collect_log_facts(
     context_lines: int = 3,
     excerpt_token_budget: int = 1200,
     max_scan_bytes: int = _DEFAULT_MAX_SCAN_BYTES,
+    min_repeat_to_fold: int = _DEFAULT_MIN_REPEAT_TO_FOLD,
 ) -> LogFacts:
     """主入口：从日志文本/文件抽取确定性事实。
 
     参数:
         log_text/log_file: 二者至少提供一个；log_file 优先。
         kb_path:      chip-manual-kit 的 knowledge.json 路径（可选，用于寄存器反查）。
-        source_root:  源码根目录（可选，用于定位源码上下文）。
+        source_root:  源码根目录（可选，用于定位源码上下文；同时也是 Phase 3
+                      架构规则记忆 learned_registers.json 的加载位置）。
         context_lines: 关键行/源码行的上下文窗口大小。
         excerpt_token_budget: 摘录喂给模型的 token 预算。
         max_scan_bytes: 超大日志文件只扫描尾部这么多字节。
+        min_repeat_to_fold: 同一归一化模板的高危报错达到这个次数才折叠为 ErrorGroup。
     """
     lines, file_truncated, line_offset = _read_lines(log_text, log_file, max_scan_bytes)
     raw_text = "\n".join(lines)
@@ -458,9 +647,12 @@ def collect_log_facts(
     facts = LogFacts(
         total_lines_scanned=len(lines), truncated=file_truncated, line_offset=line_offset
     )
-    facts.excerpt = _extract_excerpt(lines, context_lines, excerpt_token_budget, line_offset)
+    facts.excerpt, facts.error_groups = _extract_excerpt(
+        lines, context_lines, excerpt_token_budget, line_offset, min_repeat_to_fold
+    )
     facts.hex_tokens = _extract_hex_tokens(lines)
-    facts.register_hits = _lookup_registers(facts.hex_tokens, raw_text, kb_path)
+    facts.register_hits = _lookup_registers(facts.hex_tokens, raw_text, kb_path, source_root)
     facts.source_locations = _extract_source_locations(raw_text)
+    facts.stack_traces = _extract_stack_traces(lines, raw_text, line_offset)
     _resolve_source_locations(facts.source_locations, source_root, context_lines)
     return facts

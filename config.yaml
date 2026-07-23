@@ -58,6 +58,28 @@ ut:
   # 从现有测试文件截取的「风格参照」注入预算（token）
   reference_token_budget: 800
 
+log_analyze:
+  # -------------------------------------------------------------------------
+  # 记忆层开关（用「时间+记忆」换取小模型的等效能力，而非要求模型更聪明）。
+  # 记忆文件存放在 <source_root>/.ai_toolkit/ 下，不依赖任何外部 kb.json。
+  # 未提供 --src 时记忆自动不启用（无副作用，等价于原来的无状态版本）。
+  # -------------------------------------------------------------------------
+  enable_memory: true
+  # 记忆目录名（案例记忆 log_cases.jsonl、架构规则记忆 learned_registers.json 都放这里）
+  memory_dir_name: ".ai_toolkit"
+  # 案例记忆 Jaccard 相似度阈值：达到 weak 才值得关注，达到 strong 且已人工确认
+  # （confirmed=True）才允许直接短路复用、跳过 LLM 调用。
+  weak_similarity_threshold: 0.4
+  strong_similarity_threshold: 0.75
+  # 小模型安全默认：未确认的历史案例默认不注入 prompt，避免 7B-9B 模型
+  # 把"仅供参考的旧案例"和"本次真实证据"搞混、降低 grounded 校验意义。
+  # 如果确认小模型能稳定分辨"参考资料 vs 当前事实"，可手动打开。
+  inject_weak_cases: false
+  # 同一归一化模板的高危报错达到这个次数才折叠为 ErrorGroup（避免刷屏式重复报错
+  # 占满 excerpt 预算，挤掉真正有价值的、不同类型的报错）。
+  min_repeat_to_fold: 3
+
+
 validator:
   # 确定性校验子进程超时（秒）
   pytest_timeout: 60

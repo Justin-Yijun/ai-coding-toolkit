@@ -371,6 +371,63 @@ def check_grounded_references(
 
 
 # -----------------------------------------------------------------------------
+# 7b) 一致性校验：回答里点名引用的「第 N 行 / line N」是否真实出自事实集合
+#    —— 比 grounded 校验更进一步：grounded 只查十六进制值/file:line 这类具体符号，
+#       但模型也可能引用一个「确实存在于日志里、但和本次问题无关」的行号来凑数
+#       （半臆造：引用是真的，但支撑关系是编的）。这里把事实里所有「确定出现过的
+#       行号」（摘录行号 + 源码定位行号 + 调用栈锚点/帧行号 + 重复报错折叠的首末行）
+#       汇总成允许集合，回答里任何「第 N 行」式引用若不在其中，视为可疑引用。
+# -----------------------------------------------------------------------------
+_EXCERPT_LINE_NO_RE = re.compile(r"^\s*(\d+):\s?")
+_CITED_LINE_NO_RE = re.compile(r"第\s*(\d+)\s*行|\bline\s+(\d+)\b", re.IGNORECASE)
+
+
+def check_answer_cites_primary_evidence(answer: str, facts) -> CheckResult:
+    """校验回答里「第 N 行 / line N」式的行号引用，是否都出自 LogFacts 已确认的证据行。
+
+    allowed_lines 为空（事实里没有任何带行号的素材）时不做强校验，直接通过——
+    避免在纯文本、无行号语境的日志上误报。
+    """
+    allowed_lines: Set[int] = set()
+
+    for line in (facts.excerpt or "").splitlines():
+        m = _EXCERPT_LINE_NO_RE.match(line)
+        if m:
+            allowed_lines.add(int(m.group(1)))
+
+    for loc in getattr(facts, "source_locations", []) or []:
+        allowed_lines.add(loc.line)
+
+    for st in getattr(facts, "stack_traces", []) or []:
+        allowed_lines.add(st.anchor_line)
+        for fr in st.frames:
+            if fr.line:
+                allowed_lines.add(fr.line)
+
+    for g in getattr(facts, "error_groups", []) or []:
+        allowed_lines.add(g.first_line)
+        allowed_lines.add(g.last_line)
+
+    if not allowed_lines:
+        return CheckResult(ok=True)
+
+    cited: Set[int] = set()
+    for m in _CITED_LINE_NO_RE.finditer(answer):
+        num = m.group(1) or m.group(2)
+        if num:
+            cited.add(int(num))
+
+    bad = sorted(cited - allowed_lines)
+    if bad:
+        nums = "、".join(str(n) for n in bad)
+        return CheckResult(
+            ok=False,
+            error=f"引用了事实之外的行号（不在摘录/源码定位/调用栈/折叠报错的任何行号内，疑似臆造）: {nums}",
+        )
+    return CheckResult(ok=True)
+
+
+# -----------------------------------------------------------------------------
 # 内部辅助
 # -----------------------------------------------------------------------------
 def _module_available(name: str) -> bool:

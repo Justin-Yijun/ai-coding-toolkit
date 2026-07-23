@@ -143,6 +143,27 @@ class ValidatorAntiHallucinationTests(unittest.TestCase):
         result = validator.check_grounded_references("提到了 0xABCD 但没有给约束。")
         self.assertTrue(result.ok)
 
+    def test_cites_primary_evidence_flags_unknown_line(self) -> None:
+        facts = collect_log_facts(
+            log_text="\n".join(f"line{i}" for i in range(5)) + "\nERROR: boom",
+            context_lines=1,
+        )
+        result = validator.check_answer_cites_primary_evidence("问题出在第 999 行。", facts)
+        self.assertFalse(result.ok)
+        self.assertIn("999", result.error)
+
+    def test_cites_primary_evidence_passes_for_real_excerpt_line(self) -> None:
+        lines = [f"line{i}" for i in range(5)]
+        lines[3] = "ERROR: boom"
+        facts = collect_log_facts(log_text="\n".join(lines), context_lines=1)
+        result = validator.check_answer_cites_primary_evidence("问题出在第 4 行。", facts)
+        self.assertTrue(result.ok)
+
+    def test_cites_primary_evidence_skips_when_no_line_facts(self) -> None:
+        facts = collect_log_facts(log_text="")
+        result = validator.check_answer_cites_primary_evidence("第 12345 行有问题。", facts)
+        self.assertTrue(result.ok)
+
 
 class LogFactsTests(unittest.TestCase):
     def test_excerpt_centers_on_keyword_with_context(self) -> None:
@@ -284,6 +305,88 @@ class LogFactsTests(unittest.TestCase):
             self.assertEqual(len(facts.source_locations), 1)
             self.assertTrue(facts.source_locations[0].ambiguous)
             self.assertEqual(facts.source_locations[0].context, "")
+        finally:
+            tmp.cleanup()
+
+    def test_repeated_error_folds_into_error_group(self) -> None:
+        # 同一归一化模板的高危报错重复 >= min_repeat_to_fold 次时，应折叠为
+        # 一条 ErrorGroup（只保留首末位置），而不是把整批命中窗口都摘进 excerpt。
+        lines = []
+        for i in range(20):
+            lines.append(f"2026-05-28T07:0{i % 6}:00Z ERROR: retry failed for port {i} at 0xAA{i:02d}")
+        text = "\n".join(lines)
+        facts = collect_log_facts(log_text=text, context_lines=1, min_repeat_to_fold=3)
+        self.assertEqual(len(facts.error_groups), 1)
+        group = facts.error_groups[0]
+        self.assertEqual(group.first_line, 1)
+        self.assertEqual(group.last_line, 20)
+        self.assertEqual(group.count, 20)
+
+    def test_repeat_below_threshold_not_folded(self) -> None:
+        lines = [f"noise {i}" for i in range(10)]
+        lines[3] = "ERROR: fault A"
+        lines[7] = "ERROR: fault B"
+        text = "\n".join(lines)
+        facts = collect_log_facts(log_text=text, context_lines=1, min_repeat_to_fold=3)
+        self.assertEqual(facts.error_groups, [])
+
+    def test_gdb_style_stack_trace_parsed(self) -> None:
+        lines = [
+            "some preceding log line",
+            "#0  0x0000aaaa in dma_start_transfer (len=99) at drivers/dma_ctrl.c:12",
+            "#1  0x0000bbbb in dma_ioctl_handler () at drivers/dma_ctrl.c:40",
+            "some trailing log line",
+        ]
+        text = "\n".join(lines)
+        facts = collect_log_facts(log_text=text, context_lines=1)
+        self.assertEqual(len(facts.stack_traces), 1)
+        trace = facts.stack_traces[0]
+        self.assertEqual([fr.index for fr in trace.frames], [0, 1])
+        self.assertEqual(trace.frames[0].function, "dma_start_transfer")
+        self.assertEqual(trace.frames[0].file, "drivers/dma_ctrl.c")
+        self.assertEqual(trace.frames[0].line, 12)
+        self.assertEqual(trace.anchor_line, 2)
+
+    def test_python_traceback_parsed(self) -> None:
+        lines = [
+            "Traceback (most recent call last):",
+            '  File "app/main.py", line 10, in run',
+            '  File "app/worker.py", line 42, in process',
+            "ValueError: bad value",
+        ]
+        text = "\n".join(lines)
+        facts = collect_log_facts(log_text=text, context_lines=1)
+        self.assertEqual(len(facts.stack_traces), 1)
+        trace = facts.stack_traces[0]
+        self.assertEqual(len(trace.frames), 2)
+        self.assertEqual(trace.frames[0].function, "run")
+        self.assertEqual(trace.frames[0].file, "app/main.py")
+        self.assertEqual(trace.frames[0].line, 10)
+        self.assertEqual(trace.frames[1].function, "process")
+
+    def test_glibc_assert_produces_single_frame_stack_trace(self) -> None:
+        log_text = "Assertion failed: len <= MAX, file drivers/dma_ctrl.c, line 12, function dma_start_transfer"
+        facts = collect_log_facts(log_text=log_text)
+        self.assertEqual(len(facts.stack_traces), 1)
+        trace = facts.stack_traces[0]
+        self.assertEqual(len(trace.frames), 1)
+        self.assertEqual(trace.frames[0].function, "dma_start_transfer")
+        self.assertEqual(trace.frames[0].file, "drivers/dma_ctrl.c")
+        self.assertEqual(trace.frames[0].line, 12)
+
+    def test_learned_registers_merge_with_kb(self) -> None:
+        # Phase 3：learned_registers.json（人工确认的架构规则）应与外部 kb 叠加，
+        # 且完全不依赖 kb_path（即使不传 kb_path 也能命中）。
+        from core import learned_registers
+        tmp = tempfile.TemporaryDirectory()
+        try:
+            ok = learned_registers.add_register_note(tmp.name, "0x2020=MY_REG 自定义寄存器")
+            self.assertTrue(ok)
+            facts = collect_log_facts(
+                log_text="dump: reg=0x2020 val=0x1", source_root=tmp.name
+            )
+            names = [h.register_name for h in facts.register_hits]
+            self.assertIn("MY_REG", names)
         finally:
             tmp.cleanup()
 

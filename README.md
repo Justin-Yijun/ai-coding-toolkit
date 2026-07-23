@@ -29,8 +29,11 @@ ai_toolkit/
 ├── core/                # 基础设施层
 │   ├── llm_client.py    # Ollama /api/generate 封装
 │   ├── validator.py     # AST / 正则 / pytest / mypy / 防臆造 / grounded 校验
-│   ├── project_facts.py # 项目级确定性事实抽取（已有头文件/模块/符号/命名风格）
-│   ├── log_facts.py     # 日志确定性事实抽取（关键行/十六进制/寄存器反查/源码定位）
+│   ├── project_facts.py # 项目级确定性事实抽取（已有头文件/模块/符号/命名风格；目录指纹缓存）
+│   ├── log_facts.py     # 日志确定性事实抽取（关键行/重复报错折叠/结构化调用栈/十六进制/寄存器反查/源码定位）
+│   ├── log_memory.py    # 日志案例记忆（长期·案例层：Jaccard 相似度检索历史案例）
+│   ├── learned_registers.py # 架构规则记忆（长期·语义层：人工确认的寄存器规则，与外部 kb.json 解耦）
+│   ├── ut_framework.py  # UT 框架探测与风格参照抽取（目录指纹缓存）
 │   ├── lang_utils.py    # 多语言片段抽取（函数体/骨架/include/import）
 │   └── text_utils.py    # 代码块提取、token 估算与裁剪
 ├── tools/               # 无状态功能 Skill
@@ -40,7 +43,7 @@ ai_toolkit/
 │   ├── product_gen.py   # 产品代码生成（项目骨架 + 项目事实防臆造；Python 与 C/C++）
 │   ├── log_analyze.py   # 日志问题分析（确定性抽取事实 + grounded 防幻觉校验）
 │   └── summarize_gen.py # 目录总结（分而治之：骨架→逐文件分析→记录拼接；支持 focus / 深度模式）
-└── tests/               # 确定性单测（project_facts/log_facts/validator/黄金循环防幻觉）
+└── tests/               # 确定性单测（project_facts/log_facts/log_memory/validator/缓存/黄金循环防幻觉）
 ```
 
 ## 一键环境搭建
@@ -126,8 +129,9 @@ python main.py product --root ./myproject --req "新增一个 LRU 缓存类"
 > `check_cpp_includes_exist`）→ 新符号是否与项目重名（`check_no_symbol_redefinition`），
 > 任一环节失败都会把具体错误塞回 Prompt 重试，最多 3 轮。
 > 这套防臆造校验**不需要真实构建系统**（编译器/工具链缺失时也能跑），
-> 拦住的是弱模型最常见的两类错：编一个不存在的头文件/模块名、悄悄和项目里已有的定义重名。
-
+> 拦住的是弱模型最常见的两类错：编一个不存在的头文件/模块名、悄悄和项目里已有的定义重名。>
+> `core/project_facts.py` 扫描结果按「文件数 + 最大 mtime」目录指纹缓存在
+> `<root>/.ai_toolkit/project_facts_cache.json`，项目未变化时直接复用，跳过全量重扫。
 ### 5️⃣ 日志问题分析（log）—— 小模型也不敢瞎编日志细节
 ```powershell
 # 最简单：直接分析一段日志文本
@@ -158,6 +162,50 @@ python main.py log --file crash.log --question "这个故障和 DMA 有没有关
 > 报错挤出去。现在按"高危词优先、全零标量/元组自动排除、预算不足时保留【更靠后】的窗口"
 > 三条规则处理，修复后小模型（7B/9B）一次性正确定位到日志中段一处 SFP 激光器关闭失败
 > （`EStatus_NotPresent`）并给出合理排查建议，全程约 2 分钟、无需人工干预。
+
+#### 记忆层：用「时间 + 记忆」换小模型的等效能力
+本工具的设计初衷之一：小模型 + 时间 + 记忆 ≈ 大模型的效果。日志分析在确定性事实
+之外，进一步引入两层**长期记忆**（与本次调用的 `LogFacts` 这种**短期记忆**明确区分开）：
+
+- **案例记忆**（`core/log_memory.py`，具体实例，可能过期）：每次 grounded 校验通过后，
+  自动把「事实签名（十六进制 token / file:line / 严重程度类型）→ 结论」存成一条
+  **未确认**案例，落盘在 `<source_root>/.ai_toolkit/log_cases.jsonl`；用
+  `log-confirm` 人工确认某条结论正确后，之后再遇到高度相似（Jaccard 相似度）的
+  日志会**直接复用结论、跳过模型调用**。未确认案例默认不注入 Prompt（见下方
+  `inject_weak_cases`），避免小模型把「仅供参考的旧案例」和「本次真实证据」搞混。
+- **架构规则记忆**（`core/learned_registers.py`，通用规则，几乎不过期）：通过
+  `log-confirm --register-note "0xADDR=名称 描述"` 手工登记的寄存器地址含义，
+  落盘在 `<source_root>/.ai_toolkit/learned_registers.json`，与外部
+  chip-manual-kit 的 `knowledge.json` **完全解耦**、结果叠加使用。
+
+两层记忆都**只在提供 `--src` 时启用**，无 `--src` 时行为与原无状态版本完全一致。
+
+```powershell
+# 分析日志：输出末尾会打印 case_id（未确认）或 reused_case_id（已确认命中）
+python main.py log --file crash.log --src ../l1sw
+
+# 确认某次结论正确，之后同类日志可直接复用、跳过模型调用
+python main.py log-confirm --src ../l1sw --case-id abc123456789
+
+# 顺便登记一条寄存器规则（架构规则记忆，人工确认过才会写入）
+python main.py log-confirm --src ../l1sw --case-id abc123456789 --register-note "0x1010=CTRL_STATUS 控制状态寄存器"
+
+# 禁用本次调用的记忆检索/自动入库（不影响已落盘的历史记忆）
+python main.py log --file crash.log --src ../l1sw --no-memory
+```
+
+`config.yaml` 的 `log_analyze` 段可调：`enable_memory`、`weak_similarity_threshold`
+（默认 0.4）、`strong_similarity_threshold`（默认 0.75，且必须 `confirmed=True` 才会
+短路复用）、`inject_weak_cases`（默认 `false`，小模型安全默认）、`min_repeat_to_fold`
+（默认 3：同类高危报错重复达到这个次数就折叠为一条【重复报错折叠】，避免刷屏式重复
+报错占满摘录预算）。
+
+此外 `core/log_facts.py` 现在还会解析出**结构化调用栈**（GDB/glibc backtrace、
+Python traceback 均支持，`#0` 为最内层/崩溃点），连同折叠后的重复报错一并注入
+Prompt；`core/validator.py` 新增 `check_answer_cites_primary_evidence`，在
+grounded 校验（查十六进制值/file:line 是否真实存在）之外，进一步核对回答里
+「第 N 行」式的引用是否真的出自这些证据——防止模型引用一个真实存在但无关的
+行号来凑数（半臆造）。
 
 ### 6️⃣ 目录总结（summarize）—— 分而治之读大项目
 面对「上下文窗口小、项目很大」：每个文件先抽骨架→逐个喂模型出摘要（**边做边落盘，天然断点续跑**）→超预算就分层压缩归并。
@@ -210,6 +258,8 @@ python main.py ut --file src/calc.cpp --func add --framework googletest
 - 探测逻辑：扫描项目中的测试文件，按「头文件 include + 测试宏」打分选出主用框架；
 - 参照注入：截取一段现有测试（默认 800 tokens）作 few-shot，让新单测沿用项目写法；
 - C/C++ 离线无统一构建环境时，以「结构性校验」作为确定性闸门（可扩展为真实编译）。
+- 扫描打分结果（最耗时的部分）按目录指纹缓存在 `<root>/.ai_toolkit/ut_framework_cache.json`，
+  项目未变化时跳过重新读取/打分所有源文件。
 
 > 默认框架可在 `config.yaml` 的 `ut.framework` 写死，留空则自动探测。
 
@@ -229,7 +279,9 @@ python main.py batch --jobs jobs.json
 ## 跑测试
 
 `tests/` 下是纯确定性单测（不连 Ollama），覆盖事实抽取（`project_facts`/`log_facts`）、
-新增的防臆造/grounded 校验，以及用 `FakeClient` 隔离真实模型的黄金循环集成测试：
+案例记忆与架构规则记忆（`log_memory`/`learned_registers`）、目录指纹缓存
+（`project_facts`/`ut_framework`）、新增的防臆造/grounded/一致性校验，
+以及用 `FakeClient` 隔离真实模型的黄金循环集成测试（含记忆层短路复用/自动入库行为）：
 
 ```powershell
 python -m pytest tests/ -v
